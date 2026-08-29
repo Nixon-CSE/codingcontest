@@ -1,0 +1,6 @@
+{
+  "name": "CodeContest Platform",
+  "description": "Production-ready high-concurrency online coding contest platform for collegiate programming competitions with real-time scoring, submission queue, Judge0 execution, and integrity monitoring.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
