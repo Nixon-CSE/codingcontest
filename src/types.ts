@@ -138,6 +138,7 @@ export interface Submission {
   passedTests: number;
   totalTests: number;
   testResults: TestCaseResult[];
+  judge0Tokens?: { token: string; testIndex: number; isHidden: boolean }[];
   compileOutput?: string;
   error?: string;
   retryCount: number;

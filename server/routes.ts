@@ -3,7 +3,7 @@ import { ContestStore, DEFAULT_CONTEST_ID } from './contestStore';
 import { Judge0Client } from './judge0';
 import { SubmissionQueue } from './queue';
 import { RateLimiter } from './rateLimiter';
-import { computeLeaderboard } from './scoring';
+import { computeLeaderboard, updateParticipantScore } from './scoring';
 import { run50ParticipantLoadTest } from './loadTester';
 import { REFERENCE_SOLUTIONS } from './referenceSolutions';
 import {
@@ -14,6 +14,7 @@ import {
   ContestStatus,
   Problem,
   SystemHealth,
+  Verdict,
 } from '../src/types';
 
 export const apiRouter = Router();
@@ -24,6 +25,21 @@ const judge0 = new Judge0Client();
 
 // Server start time for uptime tracking
 const SERVER_START_TIME = Date.now();
+
+// Lightweight, unauthenticated, non-blocking health checks (Vercel & monitoring compatible)
+apiRouter.get('/health', (req: Request, res: Response) => {
+  res.status(200).json({
+    status: 'ok',
+    service: 'contest-platform',
+  });
+});
+
+apiRouter.get('/api/health', (req: Request, res: Response) => {
+  res.status(200).json({
+    status: 'ok',
+    service: 'contest-platform',
+  });
+});
 
 // Request logging middleware with Request ID
 apiRouter.use((req: Request, res: Response, next: NextFunction) => {
@@ -252,7 +268,7 @@ apiRouter.get('/contests/:contestId/leaderboard', (req: Request, res: Response) 
 });
 
 // ==========================================
-// 3. CODE EXECUTION & SUBMISSIONS
+// 3. CODE EXECUTION & SUBMISSIONS (Asynchronous Serverless Flow)
 // ==========================================
 
 // RUN code (Sample public tests only, rate-limited)
@@ -286,6 +302,19 @@ apiRouter.post('/problems/:problemId/run', async (req: Request, res: Response) =
 
   const submissionId = `run_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
 
+  const testCasesToRun = customInput
+    ? [{ input: customInput, expectedOutput: '', isHidden: false }]
+    : problem.publicTestCases.map((tc) => ({ ...tc, isHidden: false }));
+
+  // Asynchronously dispatch batch execution to Judge0 without blocking
+  const judge0Tokens = await judge0.createBatchSubmission(
+    language,
+    code,
+    testCasesToRun,
+    problem.cpuLimitSeconds,
+    problem.memoryLimitMb
+  );
+
   const submission: Submission = {
     id: submissionId,
     idempotencyKey: `run_${pId}_${Date.now()}`,
@@ -302,14 +331,14 @@ apiRouter.post('/problems/:problemId/run', async (req: Request, res: Response) =
     score: 0,
     maxScore: 0,
     passedTests: 0,
-    totalTests: customInput ? 1 : problem.publicTestCases.length,
+    totalTests: testCasesToRun.length,
     testResults: [],
+    judge0Tokens,
     retryCount: 0,
     createdAt: new Date().toISOString(),
   };
 
-  // Enqueue job for background execution
-  queue.enqueue(submission);
+  store.saveSubmission(submission);
 
   res.status(202).json({
     message: 'Code run queued — evaluating against sample test cases...',
@@ -324,17 +353,30 @@ apiRouter.post('/problems/:problemId/submit', async (req: Request, res: Response
   const { language, code, participantId, idempotencyKey } = req.body;
   const problemId = req.params.problemId;
 
+  // 1. Validate authentication
+  if (!user) {
+    res.status(401).json({ error: 'Authentication required to submit solution.' });
+    return;
+  }
+
+  // 2. Validate language and source code
   if (!language || !code) {
     res.status(400).json({ error: 'Language and source code are required.' });
     return;
   }
 
-  const pId = participantId || (user ? `participant-${user.uid}` : 'guest_participant');
+  const pId = participantId || `participant-${user.uid}`;
 
-  // Server-authoritative timer check
+  // 3. Validate contest is still active (Server-authoritative timer check)
   const contest = store.contest;
   const now = Date.now();
+  const contestStart = new Date(contest.startTime).getTime();
   const contestEnd = new Date(contest.endTime).getTime();
+
+  if (now < contestStart) {
+    res.status(400).json({ error: 'The contest has not started yet.' });
+    return;
+  }
 
   if (now > contestEnd + 30000) {
     // 30s clock-skew tolerance
@@ -342,7 +384,14 @@ apiRouter.post('/problems/:problemId/submit', async (req: Request, res: Response
     return;
   }
 
-  // Idempotency check to avoid double submission on network reconnect
+  // 4. Validate problem exists
+  const problem = store.getProblemById(problemId);
+  if (!problem) {
+    res.status(404).json({ error: 'Problem not found' });
+    return;
+  }
+
+  // 5. Idempotency check to avoid double submission on network reconnect
   if (idempotencyKey) {
     const existing = store.getSubmissionByIdempotencyKey(idempotencyKey);
     if (existing) {
@@ -355,25 +404,32 @@ apiRouter.post('/problems/:problemId/submit', async (req: Request, res: Response
     }
   }
 
-  // Rate & Attempt Limits check
+  // 6. Rate & Attempt Limits check
   const limitCheck = RateLimiter.checkSubmitLimit(pId, problemId);
   if (!limitCheck.allowed) {
     res.status(429).json({ error: limitCheck.message });
     return;
   }
 
-  const problem = store.getProblemById(problemId);
-  if (!problem) {
-    res.status(404).json({ error: 'Problem not found' });
-    return;
-  }
-
+  // 7. Generate unique submission ID/idempotency key
   const submissionId = `sub_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
   const key = idempotencyKey || `idem_${submissionId}`;
 
-  const totalHiddenCount = problem.hiddenTestCases ? problem.hiddenTestCases.length : 0;
-  const totalTestCount = problem.publicTestCases.length + totalHiddenCount;
+  const allTestCases = [
+    ...problem.publicTestCases.map((tc) => ({ ...tc, isHidden: false })),
+    ...(problem.hiddenTestCases || []).map((tc) => ({ ...tc, isHidden: true })),
+  ];
 
+  // 8. Send code to Judge0 asynchronously (returns token batch immediately)
+  const judge0Tokens = await judge0.createBatchSubmission(
+    language,
+    code,
+    allTestCases,
+    problem.cpuLimitSeconds,
+    problem.memoryLimitMb
+  );
+
+  // 9. Store submission with status QUEUED and Judge0 tokens
   const submission: Submission = {
     id: submissionId,
     idempotencyKey: key,
@@ -390,14 +446,16 @@ apiRouter.post('/problems/:problemId/submit', async (req: Request, res: Response
     score: 0,
     maxScore: problem.points,
     passedTests: 0,
-    totalTests: totalTestCount,
+    totalTests: allTestCases.length,
     testResults: [],
+    judge0Tokens,
     retryCount: 0,
     createdAt: new Date().toISOString(),
   };
 
-  queue.enqueue(submission);
+  store.saveSubmission(submission);
 
+  // 10. Return immediately to browser
   res.status(202).json({
     message: 'Submission received — evaluating...',
     submissionId: submission.id,
@@ -406,16 +464,85 @@ apiRouter.post('/problems/:problemId/submit', async (req: Request, res: Response
   });
 });
 
-// Check status of a submission
-apiRouter.get('/submissions/:submissionId', (req: Request, res: Response) => {
+// Check status of a submission (Evaluates Judge0 tokens on-demand if still processing)
+apiRouter.get('/submissions/:submissionId', async (req: Request, res: Response) => {
   const sub = store.getSubmission(req.params.submissionId);
   if (!sub) {
     res.status(404).json({ error: 'Submission not found' });
     return;
   }
 
+  // If submission is still QUEUED or PROCESSING, check Judge0 result
+  if (sub.status === 'QUEUED' || sub.status === 'PROCESSING') {
+    const problem = store.getProblemById(sub.problemId);
+    if (problem) {
+      const isRun = sub.type === 'RUN';
+      const testCases = isRun
+        ? problem.publicTestCases.map((tc) => ({ ...tc, isHidden: false }))
+        : [
+            ...problem.publicTestCases.map((tc) => ({ ...tc, isHidden: false })),
+            ...(problem.hiddenTestCases || []).map((tc) => ({ ...tc, isHidden: true })),
+          ];
+
+      try {
+        const checkResult = await judge0.checkBatchSubmission(
+          sub.judge0Tokens || [],
+          testCases,
+          sub.language,
+          sub.code,
+          problem.cpuLimitSeconds
+        );
+
+        if (checkResult.completed && checkResult.results) {
+          const results = checkResult.results;
+          let passedCount = 0;
+          let overallVerdict: Verdict = 'ACCEPTED';
+
+          for (const tr of results) {
+            if (tr.passed) {
+              passedCount++;
+            } else if (overallVerdict === 'ACCEPTED') {
+              overallVerdict = tr.verdict;
+            }
+          }
+
+          const totalTests = testCases.length;
+          const scoreRatio = totalTests > 0 ? passedCount / totalTests : 0;
+          const finalScore = isRun ? 0 : Math.round(problem.points * scoreRatio);
+
+          sub.status = 'COMPLETED';
+          sub.overallVerdict = overallVerdict;
+          sub.passedTests = passedCount;
+          sub.totalTests = totalTests;
+          sub.score = finalScore;
+          sub.maxScore = isRun ? 0 : problem.points;
+          sub.testResults = results;
+          sub.completedAt = new Date().toISOString();
+
+          store.saveSubmission(sub);
+
+          // Update participant score server-side if official submit
+          if (!isRun) {
+            updateParticipantScore(
+              sub.participantId,
+              sub.problemId,
+              finalScore,
+              passedCount === totalTests,
+              sub.id
+            );
+          }
+        } else {
+          sub.status = 'PROCESSING';
+          store.saveSubmission(sub);
+        }
+      } catch (err: any) {
+        console.error(`[SubmissionEvaluation] Check error for ${sub.id}:`, err.message);
+      }
+    }
+  }
+
   // Public/participant response (Hide hidden test case inputs and expected outputs)
-  const sanitizedTestResults = sub.testResults.map((tr) => {
+  const sanitizedTestResults = (sub.testResults || []).map((tr) => {
     if (tr.isHidden) {
       return {
         testIndex: tr.testIndex,
@@ -424,6 +551,7 @@ apiRouter.get('/submissions/:submissionId', (req: Request, res: Response) => {
         verdict: tr.verdict,
         executionTimeSec: tr.executionTimeSec,
         memoryKb: tr.memoryKb,
+        compileOutput: tr.compileOutput,
       };
     }
     return tr;

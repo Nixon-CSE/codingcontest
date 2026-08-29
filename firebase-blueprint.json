@@ -1,0 +1,100 @@
+{
+  "entities": {
+    "Contest": {
+      "title": "Contest",
+      "description": "Programming competition metadata and configuration",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 256 },
+        "description": { "type": "string", "maxLength": 2048 },
+        "startTime": { "type": "string", "format": "date-time" },
+        "endTime": { "type": "string", "format": "date-time" },
+        "status": { "type": "string", "enum": ["DRAFT", "PUBLISHED", "RUNNING", "ENDED"] },
+        "accessCode": { "type": "string", "maxLength": 64 }
+      },
+      "required": ["id", "title", "startTime", "endTime", "status"]
+    },
+    "Problem": {
+      "title": "Problem",
+      "description": "Contest problem description and sanitized test cases",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "contestId": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 256 },
+        "statement": { "type": "string", "maxLength": 10000 },
+        "points": { "type": "number" },
+        "difficulty": { "type": "string", "enum": ["EASY", "MEDIUM", "HARD"] }
+      },
+      "required": ["id", "contestId", "title", "statement", "points"]
+    },
+    "Participant": {
+      "title": "Participant",
+      "description": "Contestant profile, integrity score, and server-authoritative points",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "userId": { "type": "string", "maxLength": 128 },
+        "contestId": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 128 },
+        "email": { "type": "string", "maxLength": 128 },
+        "totalScore": { "type": "number" },
+        "solvedCount": { "type": "number" },
+        "riskLevel": { "type": "string", "enum": ["LOW", "MEDIUM", "HIGH"] }
+      },
+      "required": ["id", "userId", "contestId", "name", "email"]
+    },
+    "Submission": {
+      "title": "Submission",
+      "description": "Participant code submission record with server-evaluated verdict",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "participantId": { "type": "string", "maxLength": 128 },
+        "contestId": { "type": "string", "maxLength": 128 },
+        "problemId": { "type": "string", "maxLength": 128 },
+        "language": { "type": "string", "maxLength": 32 },
+        "status": { "type": "string", "enum": ["QUEUED", "PROCESSING", "COMPLETED", "FAILED", "TIMEOUT"] },
+        "score": { "type": "number" }
+      },
+      "required": ["id", "participantId", "contestId", "problemId", "language", "status"]
+    },
+    "IntegrityEvent": {
+      "title": "IntegrityEvent",
+      "description": "Browser focus loss, fullscreen exit, or copy/paste security telemetry event",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "participantId": { "type": "string", "maxLength": 128 },
+        "contestId": { "type": "string", "maxLength": 128 },
+        "eventType": { "type": "string", "maxLength": 64 },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "severity": { "type": "string", "enum": ["INFO", "WARNING", "CRITICAL"] }
+      },
+      "required": ["id", "participantId", "contestId", "eventType", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/contests/{contestId}": {
+      "schema": "Contest",
+      "description": "Contest settings, schedule, and rules"
+    },
+    "/problems/{problemId}": {
+      "schema": "Problem",
+      "description": "Sanitized problem statements for contestant viewing"
+    },
+    "/participants/{participantId}": {
+      "schema": "Participant",
+      "description": "Participant registry and server-authoritative leaderboard scores"
+    },
+    "/submissions/{submissionId}": {
+      "schema": "Submission",
+      "description": "Code submission records and evaluation verdicts"
+    },
+    "/integrityEvents/{eventId}": {
+      "schema": "IntegrityEvent",
+      "description": "Security audit logs for proctoring"
+    }
+  }
+}

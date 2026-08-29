@@ -110,6 +110,143 @@ export class Judge0Client {
     }
   }
 
+  // Create asynchronous batch submission for Vercel serverless submission flow
+  public async createBatchSubmission(
+    language: string,
+    sourceCode: string,
+    testCases: TestCase[],
+    cpuLimitSec = 2.0,
+    memoryLimitMb = 256
+  ): Promise<{ token: string; testIndex: number; isHidden: boolean }[]> {
+    const langId = LANGUAGE_IDS[language.toLowerCase()] || 71;
+
+    if (this.config.apiKey || (!this.config.apiUrl.includes('rapidapi.com') && this.config.apiUrl.startsWith('http'))) {
+      try {
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+        };
+        if (this.config.apiKey) {
+          headers['x-rapidapi-key'] = this.config.apiKey;
+          headers['x-rapidapi-host'] = this.config.apiHost;
+          headers['X-Auth-Token'] = this.config.apiKey;
+        }
+
+        const submissionsPayload = testCases.map((tc) => ({
+          language_id: langId,
+          source_code: Buffer.from(sourceCode).toString('base64'),
+          stdin: Buffer.from(tc.input).toString('base64'),
+          expected_output: Buffer.from(tc.expectedOutput.trim()).toString('base64'),
+          cpu_time_limit: cpuLimitSec,
+          memory_limit: memoryLimitMb * 1024,
+        }));
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+        const res = await fetch(`${this.config.apiUrl}/submissions/batch?base64_encoded=true`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ submissions: submissionsPayload }),
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+
+        if (res.ok) {
+          const data = (await res.json()) as { token: string }[];
+          if (Array.isArray(data) && data.length === testCases.length) {
+            return data.map((item, idx) => ({
+              token: item.token,
+              testIndex: idx + 1,
+              isHidden: Boolean(testCases[idx].isHidden),
+            }));
+          }
+        }
+      } catch (err: any) {
+        console.warn(`[Judge0] Async batch dispatch failed: ${err.message}. Using asynchronous sandbox token.`);
+      }
+    }
+
+    // Fallback sandbox batch tokens
+    return testCases.map((tc, idx) => ({
+      token: `sb_${Date.now()}_${idx}_${Math.random().toString(36).substring(2, 6)}`,
+      testIndex: idx + 1,
+      isHidden: Boolean(tc.isHidden),
+    }));
+  }
+
+  // Check status of batch tokens asynchronously (called by GET /api/submissions/:id)
+  public async checkBatchSubmission(
+    tokens: { token: string; testIndex: number; isHidden: boolean }[],
+    testCases: TestCase[],
+    language: string,
+    sourceCode: string,
+    cpuLimitSec = 2.0
+  ): Promise<{ completed: boolean; results?: TestCaseResult[] }> {
+    const isSandbox = tokens.some((t) => t.token.startsWith('sb_'));
+
+    if (isSandbox || !this.config.apiKey) {
+      // Evaluate instantly in high-performance sandbox
+      const results: TestCaseResult[] = [];
+      for (let i = 0; i < testCases.length; i++) {
+        const tc = testCases[i];
+        const res = await this.executeInSandbox(language, sourceCode, tc, cpuLimitSec, i + 1);
+        results.push(res);
+      }
+      return { completed: true, results };
+    }
+
+    try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (this.config.apiKey) {
+        headers['x-rapidapi-key'] = this.config.apiKey;
+        headers['x-rapidapi-host'] = this.config.apiHost;
+        headers['X-Auth-Token'] = this.config.apiKey;
+      }
+
+      const tokenList = tokens.map((t) => t.token).join(',');
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 6000);
+
+      const res = await fetch(`${this.config.apiUrl}/submissions/batch?tokens=${tokenList}&base64_encoded=true`, {
+        headers,
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+
+      if (res.ok) {
+        const data = (await res.json()) as { submissions: Judge0SubmissionResponse[] };
+        const submissions = data.submissions || [];
+
+        // Check if all test cases have finished (status.id > 2)
+        const allDone = submissions.length === tokens.length && submissions.every((s) => s.status && s.status.id > 2);
+
+        if (!allDone) {
+          return { completed: false };
+        }
+
+        const results = submissions.map((subRes, idx) => {
+          const tc = testCases[idx] || { input: '', expectedOutput: '', isHidden: tokens[idx]?.isHidden };
+          return this.mapJudge0Result(subRes, tc, Boolean(tokens[idx]?.isHidden), idx + 1);
+        });
+
+        return { completed: true, results };
+      }
+    } catch (err: any) {
+      console.warn(`[Judge0] Batch status check failed: ${err.message}. Falling back to sandbox evaluation.`);
+    }
+
+    // If remote batch query fails, evaluate via sandbox
+    const results: TestCaseResult[] = [];
+    for (let i = 0; i < testCases.length; i++) {
+      const tc = testCases[i];
+      const res = await this.executeInSandbox(language, sourceCode, tc, cpuLimitSec, i + 1);
+      results.push(res);
+    }
+    return { completed: true, results };
+  }
+
   // Execute a single test case through Judge0 API with retry & timeout
   public async executeTestCase(
     language: string,
