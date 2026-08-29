@@ -12,6 +12,14 @@ export function updateParticipantScore(
   const participant = store.getParticipant(participantId);
   if (!participant) return null;
 
+  participant.processedSubmissions = participant.processedSubmissions || [];
+
+  // Strictly prevent duplicate score processing for the exact same submission ID
+  if (participant.processedSubmissions.includes(submissionId)) {
+    return participant;
+  }
+  participant.processedSubmissions.push(submissionId);
+
   const currentProblemScore = participant.problemScores[problemId] || {
     solved: false,
     score: 0,

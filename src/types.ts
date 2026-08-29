@@ -2,7 +2,7 @@ export type UserRole = 'ADMIN' | 'PARTICIPANT';
 
 export type ContestStatus = 'DRAFT' | 'PUBLISHED' | 'RUNNING' | 'ENDED';
 
-export type SubmissionStatus = 'QUEUED' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'TIMEOUT';
+export type SubmissionStatus = 'QUEUED' | 'PROCESSING' | 'PROCESSING_RESULT' | 'COMPLETED' | 'FAILED' | 'TIMEOUT';
 
 export type ExecutionType = 'RUN' | 'SUBMIT';
 
@@ -139,6 +139,8 @@ export interface Submission {
   totalTests: number;
   testResults: TestCaseResult[];
   judge0Tokens?: { token: string; testIndex: number; isHidden: boolean }[];
+  scoreApplied?: boolean;
+  processedAt?: string;
   compileOutput?: string;
   error?: string;
   retryCount: number;
@@ -172,6 +174,7 @@ export interface Participant {
   riskLevel: RiskLevel;
   violationCount: number;
   problemScores: Record<string, ParticipantScore>;
+  processedSubmissions?: string[];
 }
 
 export interface LeaderboardEntry {

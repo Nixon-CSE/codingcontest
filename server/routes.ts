@@ -464,7 +464,7 @@ apiRouter.post('/problems/:problemId/submit', async (req: Request, res: Response
   });
 });
 
-// Check status of a submission (Evaluates Judge0 tokens on-demand if still processing)
+// Check status of a submission (Evaluates Judge0 tokens on-demand with atomic state transition)
 apiRouter.get('/submissions/:submissionId', async (req: Request, res: Response) => {
   const sub = store.getSubmission(req.params.submissionId);
   if (!sub) {
@@ -472,56 +472,97 @@ apiRouter.get('/submissions/:submissionId', async (req: Request, res: Response) 
     return;
   }
 
-  // If submission is still QUEUED or PROCESSING, check Judge0 result
-  if (sub.status === 'QUEUED' || sub.status === 'PROCESSING') {
-    const problem = store.getProblemById(sub.problemId);
-    if (problem) {
-      const isRun = sub.type === 'RUN';
-      const testCases = isRun
-        ? problem.publicTestCases.map((tc) => ({ ...tc, isHidden: false }))
-        : [
-            ...problem.publicTestCases.map((tc) => ({ ...tc, isHidden: false })),
-            ...(problem.hiddenTestCases || []).map((tc) => ({ ...tc, isHidden: true })),
-          ];
+  // 1. If submission is already in a terminal state, return stored sanitized result immediately (NO Judge0 calls, NO recalculation)
+  if (sub.status === 'COMPLETED' || sub.status === 'FAILED' || sub.status === 'TIMEOUT') {
+    const sanitizedTestResults = (sub.testResults || []).map((tr) => {
+      if (tr.isHidden) {
+        return {
+          testIndex: tr.testIndex,
+          isHidden: true,
+          passed: tr.passed,
+          verdict: tr.verdict,
+          executionTimeSec: tr.executionTimeSec,
+          memoryKb: tr.memoryKb,
+          compileOutput: tr.compileOutput,
+        };
+      }
+      return tr;
+    });
 
-      try {
-        const checkResult = await judge0.checkBatchSubmission(
-          sub.judge0Tokens || [],
-          testCases,
-          sub.language,
-          sub.code,
-          problem.cpuLimitSeconds
-        );
+    res.json({
+      submission: {
+        ...sub,
+        testResults: sanitizedTestResults,
+      },
+    });
+    return;
+  }
 
-        if (checkResult.completed && checkResult.results) {
-          const results = checkResult.results;
-          let passedCount = 0;
-          let overallVerdict: Verdict = 'ACCEPTED';
+  // 2. If another concurrent request is currently evaluating this exact submission, return in-progress status
+  if (sub.status === 'PROCESSING_RESULT') {
+    res.json({
+      submission: {
+        ...sub,
+        status: 'PROCESSING',
+        testResults: [],
+      },
+    });
+    return;
+  }
 
-          for (const tr of results) {
-            if (tr.passed) {
-              passedCount++;
-            } else if (overallVerdict === 'ACCEPTED') {
-              overallVerdict = tr.verdict;
-            }
+  // 3. Atomically lock state to PROCESSING_RESULT to prevent duplicate simultaneous evaluation
+  sub.status = 'PROCESSING_RESULT';
+  store.saveSubmission(sub);
+
+  const problem = store.getProblemById(sub.problemId);
+  if (problem) {
+    const isRun = sub.type === 'RUN';
+    const testCases = isRun
+      ? problem.publicTestCases.map((tc) => ({ ...tc, isHidden: false }))
+      : [
+          ...problem.publicTestCases.map((tc) => ({ ...tc, isHidden: false })),
+          ...(problem.hiddenTestCases || []).map((tc) => ({ ...tc, isHidden: true })),
+        ];
+
+    try {
+      const checkResult = await judge0.checkBatchSubmission(
+        sub.judge0Tokens || [],
+        testCases,
+        sub.language,
+        sub.code,
+        problem.cpuLimitSeconds
+      );
+
+      if (checkResult.completed && checkResult.results) {
+        const results = checkResult.results;
+        let passedCount = 0;
+        let overallVerdict: Verdict = 'ACCEPTED';
+
+        for (const tr of results) {
+          if (tr.passed) {
+            passedCount++;
+          } else if (overallVerdict === 'ACCEPTED') {
+            overallVerdict = tr.verdict;
           }
+        }
 
-          const totalTests = testCases.length;
-          const scoreRatio = totalTests > 0 ? passedCount / totalTests : 0;
-          const finalScore = isRun ? 0 : Math.round(problem.points * scoreRatio);
+        const totalTests = testCases.length;
+        const scoreRatio = totalTests > 0 ? passedCount / totalTests : 0;
+        const finalScore = isRun ? 0 : Math.round(problem.points * scoreRatio);
 
-          sub.status = 'COMPLETED';
-          sub.overallVerdict = overallVerdict;
-          sub.passedTests = passedCount;
-          sub.totalTests = totalTests;
-          sub.score = finalScore;
-          sub.maxScore = isRun ? 0 : problem.points;
-          sub.testResults = results;
-          sub.completedAt = new Date().toISOString();
+        sub.status = 'COMPLETED';
+        sub.overallVerdict = overallVerdict;
+        sub.passedTests = passedCount;
+        sub.totalTests = totalTests;
+        sub.score = finalScore;
+        sub.maxScore = isRun ? 0 : problem.points;
+        sub.testResults = results;
+        sub.completedAt = new Date().toISOString();
+        sub.processedAt = new Date().toISOString();
 
-          store.saveSubmission(sub);
-
-          // Update participant score server-side if official submit
+        // Ensure score is applied exactly once
+        if (!sub.scoreApplied) {
+          sub.scoreApplied = true;
           if (!isRun) {
             updateParticipantScore(
               sub.participantId,
@@ -531,14 +572,22 @@ apiRouter.get('/submissions/:submissionId', async (req: Request, res: Response) 
               sub.id
             );
           }
-        } else {
-          sub.status = 'PROCESSING';
-          store.saveSubmission(sub);
         }
-      } catch (err: any) {
-        console.error(`[SubmissionEvaluation] Check error for ${sub.id}:`, err.message);
+
+        store.saveSubmission(sub);
+      } else {
+        sub.status = 'PROCESSING';
+        store.saveSubmission(sub);
       }
+    } catch (err: any) {
+      console.error(`[SubmissionEvaluation] Check error for ${sub.id}:`, err.message);
+      sub.status = 'PROCESSING'; // Allow retry on transient error
+      store.saveSubmission(sub);
     }
+  } else {
+    sub.status = 'FAILED';
+    sub.error = 'Problem definition not found';
+    store.saveSubmission(sub);
   }
 
   // Public/participant response (Hide hidden test case inputs and expected outputs)

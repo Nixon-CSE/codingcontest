@@ -152,16 +152,26 @@ export class ApiService {
     return this.request<{ submissions: Submission[] }>(`/submissions/participant/${participantId}`);
   }
 
-  // Poll submission until completed
+  // Poll submission until completed with exponential backoff
   public static async pollSubmission(submissionId: string, onUpdate?: (sub: Submission) => void): Promise<Submission> {
-    const maxAttempts = 30; // 30 seconds max
+    const intervals = [1000, 2000, 3000, 4000, 5000]; // 1s, 2s, 3s, 4s, 5s
+    const maxAttempts = 20;
+
     for (let i = 0; i < maxAttempts; i++) {
       const res = await this.getSubmission(submissionId);
       if (onUpdate) onUpdate(res.submission);
-      if (res.submission.status === 'COMPLETED' || res.submission.status === 'FAILED' || res.submission.status === 'TIMEOUT') {
+
+      // Terminal state check - stop polling immediately
+      if (
+        res.submission.status === 'COMPLETED' ||
+        res.submission.status === 'FAILED' ||
+        res.submission.status === 'TIMEOUT'
+      ) {
         return res.submission;
       }
-      await new Promise((r) => setTimeout(r, 1000));
+
+      const delayMs = intervals[Math.min(i, intervals.length - 1)];
+      await new Promise((r) => setTimeout(r, delayMs));
     }
     throw new Error('Evaluation timed out. Your submission is still in queue.');
   }
